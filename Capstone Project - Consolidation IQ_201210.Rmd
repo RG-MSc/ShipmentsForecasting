@@ -1,0 +1,383 @@
+---
+title: "Capstone Project - Consolidation IQ"
+author: "Rene Garza"
+date: "11/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Library
+```{r}
+library(tseries)
+library(tidyverse)
+library(tsibble)
+library(lubridate)
+library(data.table)
+library(xts)
+library(dplyr)
+library(sjmisc)
+library(plotly)
+library(readr)
+library(fable)
+library(fabletools)
+library(devtools)
+library(scales)
+library(installr)
+library(urca)
+library(feasts)
+library(forecast)
+```
+
+
+# Starting From Clean Data
+
+Load Yang's data set (8/20)
+```{r}
+datapath <- 'C:/Users/reneg/OneDrive/Documents/MSCA-DESKTOP-0K6BPDD/Project/Source Logistics/Capstone/'
+dat.clean1 <- read.csv(file=paste(datapath, 'LA_2014_2020_zipcodeCluster_Final.csv', sep='/'))
+dictionary <- read.csv(file=paste(datapath, 'LA_2014_2020_zipcode_Dictionary.csv', sep='/'))
+```
+
+Create cluster location reference table
+```{r}
+clusters <- distinct(dictionary[,c(5,7:8)])[order(clusters$cluster_label),]
+row.names(clusters) <- NULL
+```
+
+
+View and exclude cluster 0 (less than 50 miles destinations are currently consolidated)
+```{r}
+dat.clean1 <- dat.clean1[!dat.clean1$cluster_label == 0,]
+dat.clean1 <- subset(dat.clean1, select = -c(X))
+head(dat.clean1)
+```
+
+Convert to date and order rows
+```{r}
+dat.clean1$TRANSACTION_DATE <- as.Date(dat.clean1$TRANSACTION_DATE, "%Y-%m-%d")
+
+dat.clean1 <- dat.clean1[order(dat.clean1$SHIP_TO_POSTAL_CODE),]
+dat.clean1 <- dat.clean1[order(dat.clean1$TRANSACTION_DATE),]
+dat.clean1 <- dat.clean1[order(dat.clean1$cluster_label),]
+
+tail(dat.clean1)
+
+#write.csv(dat.clean, "dat.clean.csv", row.names = F)
+```
+
+Notes Ashish Meeting:
+- Median delta (days) between shipments by zip code: 1 week
+- Note: consider zip codes that ship seasonally
+- Plot out in line graph
+
+Get number of days between shipments
+```{r}
+dat.clean <- dat.clean1 %>%
+                mutate(BETWEEN0=as.numeric(difftime(
+                  TRANSACTION_DATE,lag(TRANSACTION_DATE,1), units = c("days"))),
+                       BETWEEN=ifelse(is.na(BETWEEN0),0,BETWEEN0))%>%
+                        select(-BETWEEN0)
+
+head(dat.clean)
+```
+
+Replace the first value of each group with NA
+```{r}
+dat.clean <- dat.clean %>%
+                group_by(cluster_label) %>%
+                  mutate(ship_days = replace(BETWEEN, row_number() == 1, NA))
+
+dat.clean <- dat.clean[,c(1:2,6:7,10:13,15)]
+head(dat.clean)
+```
+
+Get summary statistics for zip code selection
+```{r}
+sum.dat.clean <- group_by(dat.clean, cluster_label) %>%
+                    summarize(Distance = head(distance.range,1),
+                              Earliest = min(TRANSACTION_DATE),
+                              Latest = max(TRANSACTION_DATE),
+                              Count_Cust = n_distinct(CUSTOMER_ID),
+                              Mean_Wt = mean(TOTAL_WEIGHT),
+                              Mean_Pallet = mean(PALLET_QTY),
+                              Frequency = table(cluster_label),
+                              Days = mean(ship_days[which(!is.na(ship_days))]),
+                              SD = sd(ship_days[which(!is.na(ship_days))])) %>%
+                        arrange(-Frequency)
+
+sum.dat.clean
+
+#write.csv(sum.dat.clean, "clusters_cons.csv", row.names = F)
+
+# if 95% add 2 sd
+```
+
+Select Clusters to Consolidate
+```{r}
+# Get the max expected delay by adding the avergae day delay (Days) and the standard deviation (SD)
+sum.dat.clean$Max_Delay <- sum.dat.clean$Days + sum.dat.clean$SD
+
+# Filter for zip codes with a Max_Delay under 7 (1 between shipments at max)
+top.clust <- sum.dat.clean %>%
+                filter(Max_Delay < 4 & Distance == 'less than 100 miles from warehouse' |
+                         Max_Delay < 5 & Distance == '100 to 750 miles from warehouse' | 
+                         Max_Delay < 7 & Distance == 'beyond 750 miles from warehouse')
+
+# Select clusters where the latest shipment is less than 1 month old (LABEL AS ACTIVE VS PASSIVE - PPT PURPOSES)
+top.clust <- top.clust %>%
+                filter(Latest > max(Latest) - 30)
+
+#write.csv(top.clust, "top.clust.csv", row.names = F)
+
+# Get a zip code only vector for the predictions
+top.clust.res <- top.clust[,1]
+top.clust.res.train <- top.clust[,1]
+top.clust.res
+```
+
+Loop and generate 1 month forecasts for each zip code's pallets and weight
+```{r}
+# Create rest of prediction results table
+top.clust.res$Pallets <- 0
+top.clust.res$Weight <- 0
+top.clust.res$Pallet_Model <- ""
+top.clust.res$Weight_Model <- ""
+
+top.clust.res.train$Pallets <- 0
+top.clust.res.train$Weight <- 0
+top.clust.res.train$Pallet_Model <- ""
+top.clust.res.train$Weight_Model <- ""
+
+for (i in 1:length(top.clust.res$cluster_label)){
+  for (j in 3:4){
+    #i <- 7
+    #j <- 3
+
+    dat.wt <- filter(dat.clean, cluster_label == top.clust.res[i,1])[,c(1,j)]
+    
+    dat.wt <- group_by(dat.wt, TRANSACTION_DATE) %>%
+                  summarize(Tot = ifelse(j == 3, sum(PALLET_QTY), sum(TOTAL_WEIGHT)))
+    
+    dat.wt <- dat.wt %>% 
+              complete(TRANSACTION_DATE = seq(min(TRANSACTION_DATE), max(TRANSACTION_DATE), by = "1 day"), 
+                    fill = list(Tot = 0)) %>%
+              as_tsibble(index = TRANSACTION_DATE)
+    
+    # Get weekdays
+    #business_days <- dat.wt$TRANSACTION_DATE[!is.weekend(dat.wt$TRANSACTION_DATE)]
+
+    # Apply moving average to smoothen the trend
+    ts.dat.ma <- dat.wt %>%
+      select(TRANSACTION_DATE, Tot) %>%
+      mutate(tot.ma = rollmean(Tot, k = 20, fill = NA, align = "right"),
+             #tot.ma2 = rollmean(Tot, k = 30, fill = NA, align = "right"),
+             #tot.ma3 = rollmean(Tot, k = 50, fill = NA, align = "right")
+             )
+    
+    #Visualize the trend
+    #ts.dat.ma %>%
+      #gather(metric, value,tot.ma) %>%
+      #ggplot(aes(TRANSACTION_DATE, value, color = metric)) +
+      #geom_line()
+    
+    #length(ts.dat.ma$tot.ma)
+    
+    # Buld train and test set
+    total.set = na.omit(subset(ts.dat.ma, select = -c(Tot)))
+    total.set <- total.set %>% as_tsibble(index = TRANSACTION_DATE)
+    train.set = total.set %>% slice(1:(n()-31))
+    train.set <- train.set %>% as_tsibble(index = TRANSACTION_DATE)
+    test.set = total.set %>% filter(row_number() >= (n() - 30))
+    test.set <- test.set %>% as_tsibble(index = TRANSACTION_DATE)
+    n.test <- length(test.set$tot.ma)
+
+    #train.set = train.set %>% mutate(Date = ymd(TRANSACTION_DATE))
+    
+    model.fit   = 
+      train.set %>%
+      # Fit models
+      model( 
+          # ARIMA family
+          arima = ARIMA(tot.ma),
+      
+          # ETS family
+          ets = ETS(tot.ma),
+          holt = ETS(tot.ma ~ trend("A") + season("N")),
+          holt_winters = ETS(tot.ma ~ trend("A") + season("A")),
+      
+          # TSLM
+          tslm = TSLM(tot.ma),
+      
+          # COMBINED
+          combined = combination_model(ARIMA(tot.ma),
+                                         ETS(tot.ma),
+                                         ETS(tot.ma ~ trend("A") + season("N")),
+                                         ETS(tot.ma ~ trend("A") + season("A")),
+                                         TSLM(tot.ma)))
+      
+    
+      # Forecast
+      forecast.preds <- model.fit %>%
+        forecast(h = n.test)
+
+      # accuracy of different models
+      all.acc <- accuracy(forecast.preds, test.set)
+
+      # save winning model (lowest MAPE)
+      acc.model <- all.acc[which.min(all.acc$RMSE),][1,1]
+
+      forecast.values = model.fit %>% 
+        forecast(h = n.test) %>% filter(.model == as.character(acc.model)) #consider deletting last part of code
+
+      top.clust.res.train[i,j-1] <- sum(forecast.values$.mean)
+      top.clust.res.train[i,j+1] <- acc.model      
+            
+      # # Visualize train vs test results
+      # 
+      # # forecast
+      # forecast.values = model.fit %>%
+      #   forecast(h = n.test) %>% filter(.model == as.character(acc.model))
+      # 
+      # # pick winning model only
+      # forecast.values %>%
+      #   autoplot() +
+      #   autolayer(train.set) +
+      #   geom_line(
+      #     aes(
+      #       x = test.set$TRANSACTION_DATE,
+      #       y = as.numeric(test.set$tot.ma)
+      #     ),
+      #     col = "red"
+      #   )
+
+      if (acc.model == "arima"){
+        model.fit = 
+        total.set %>%
+        model(arima = ARIMA(tot.ma))
+      } else if (acc.model == "ets"){
+        model.fit = 
+        total.set %>%
+        model(ets = ETS(tot.ma))
+      } else if (acc.model == "holt"){
+        model.fit = 
+        total.set %>%
+        model(holt = ETS(tot.ma ~ trend("A") + season("N")))
+      } else if (acc.model == "holt_winters"){
+        model.fit = 
+        total.set %>%
+        model(holt_winters = ETS(tot.ma ~ trend("A") + season("A")))
+      } else if (acc.model == "tslm"){
+        model.fit = 
+        total.set %>%
+        model(tslm = TSLM(tot.ma))
+      } else 
+        model.fit = 
+        total.set %>%
+        model(combined = combination_model(ARIMA(tot.ma),
+                                         ETS(tot.ma),
+                                         ETS(tot.ma ~ trend("A") + season("N")),
+                                         ETS(tot.ma ~ trend("A") + season("A")),
+                                         TSLM(tot.ma)))
+
+      # fitted values
+      #augment(model.fit)
+
+      # forecast 
+      forecast.values = model.fit %>% 
+        forecast(h = n.test) #%>% filter(.model == as.character(acc.model)) #consider deletting last part of code
+
+      # Alt model to explore
+      #forecast.values <- forecast(nnetar(as.ts(train.set, lambda = 0), h = 30)
+
+      # # Plot forecast
+      # forecast.values %>%
+      #   autoplot() +
+      #   autolayer(total.set)
+
+      #write.csv(ts.month, "ts.month.csv", row.names = F)
+      top.clust.res[i,j-1] <- sum(forecast.values$.mean)
+      top.clust.res[i,j+1] <- acc.model
+  }
+}
+top.clust.res.train
+top.clust.res
+#write.csv(top.clust.res, "top.clust.res.csv", row.names = F)
+```
+Notes:
+- test accuracy on last few months
+- get trainig accuracy score
+- predict models against test data
+- compare with real values: MSE
+- select the best model
+
+train accuracy vs validation accuracy
+
+
+Add column for number of trucks needed per week
+```{r}
+# The average number of weeks per month is 4.345, assume 1 truck holds 45,000 lbs or 30 pallets max
+top.clust.res$Trucks_Pallet <- top.clust.res$Pallets/30
+top.clust.res$Trucks_Weight <- top.clust.res$Weight/43500
+
+top.clust.res.train$Trucks_Pallet <- top.clust.res.train$Pallets/30
+top.clust.res.train$Trucks_Weight <- top.clust.res.train$Weight/43500
+
+top.clust.res
+#write.csv(top.clust.res, "top.clust.res.csv", row.names = F)
+```
+
+Notes:
+- look into normalizing the data
+- can you quantify the value add
+- constraint margin of error/fix the margin of error
+- multivariate time series (predict both at the same time)
+
+Measuring Impact
+```{r}
+# Create column with the maximum of the two: Trucks_Pallet & Trucks_Weight
+top.clust.res$Max_Trucks <- pmax(top.clust.res$Trucks_Pallet, top.clust.res$Trucks_Weight)
+top.clust.res.train$Max_Trucks <- pmax(top.clust.res.train$Trucks_Pallet, top.clust.res.train$Trucks_Weight)
+
+# Select those clusters that demand at least one truck per week
+top.clust.res.sel <- subset(top.clust.res, Max_Trucks > 4)
+top.clust.res.train.sel <- subset(top.clust.res.train, Max_Trucks > 4)
+top.clust.res.train.sel
+top.clust.res.sel
+final.clust.res <- merge(top.clust.res.sel, clusters, by = "cluster_label")
+final.clust.res
+# Select all the orders from the past month corresponding to such clusters to compare number of trucks necessary in the past month with those dictated by the consolidation program
+orig.clust.dat <- subset(dat.clean1, subset = cluster_label %in% top.clust.res.train.sel$cluster_label)
+orig.clust.dat <- orig.clust.dat %>%
+                      filter(TRANSACTION_DATE >= as.Date(max(orig.clust.dat$TRANSACTION_DATE - n.test)))
+
+# Number of trucks used in the last 30 days to ship to those destinations belonging to the consolidation program
+nrow(orig.clust.dat)
+#orig.clust.dat
+
+# Projection of number of trucks necessary for consolidation program
+sum(top.clust.res.train.sel$Max_Trucks)
+
+# Percent reduction of trucks necessary due to the consolidation program
+perc.red <- (nrow(orig.clust.dat)-sum(top.clust.res.train.sel$Max_Trucks))/nrow(orig.clust.dat)
+perc.red
+
+write.csv(orig.clust.dat, "orig.clust.dat.csv", row.names = F)
+write.csv(top.clust.res.train.sel, "top.clust.res.train.sel.csv", row.names = F)
+```
+
+Visualize individual cluster statistics for selection or potential addition
+```{r}
+sum.dat.clean[sum.dat.clean$cluster_label == 156,]
+clusters[clusters$cluster_label == 73,]
+```
+
+Validate
+```{r}
+orig.clust.dat
+orig.clust.dat$TRANSACTION_DATE
+orig.clust.dat$TRANSACTION_DATE - n.test
+```
+
